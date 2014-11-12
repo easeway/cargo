@@ -1,0 +1,23 @@
+---
+clusters:
+  - name: etcd
+    nodes:
+      - name: etcd
+        image: microbox/etcd
+        docker:
+            cmd:
+              - '-data-dir=/data'
+              - '-name=%{instance}'
+      - name: client
+        image: ubuntu:14.04
+        docker:
+           entrypoint: /bin/bash
+           cmd:
+              - '-c'
+              - 'while true; do sleep 1; done'
+        run:
+            commands:
+              - pwd
+              - env
+              - curl http://%{ip:etcd-0}:4001/v2/machines
+
