@@ -15,8 +15,7 @@ type DockerProperties struct {
 
 type Commands struct {
 	Files    []string `json:"files"`
-	Env      []string `json:"env"`
-	WorkDir  string   `json:"workdir"`
+	Shell    string   `json:"shell"`
 	Commands []string `json:"commands"`
 }
 

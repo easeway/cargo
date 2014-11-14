@@ -6,9 +6,11 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -42,11 +44,12 @@ type CloudEnv struct {
 }
 
 type ImageLoader struct {
-	State    *CloudState
-	Name     string
-	Complete bool
-	Logger   Logger
-	Error    error
+	State  *CloudState
+	Name   string
+	Logger Logger
+	Error  error
+
+	complete int32
 }
 
 type CloudState struct {
@@ -57,26 +60,34 @@ type CloudState struct {
 
 	stateDir  string
 	workspace string
-	lock      sync.Mutex
-	cond      *sync.Cond
+	vars      VarRepository
+
+	lock sync.Mutex
+	cond *sync.Cond
 }
 
 type NodeState struct {
 	State      *CloudState
 	Node       *Node
 	Image      string
+	LocalVars  VarRepository
 	DockerArgs []string
 	Instances  []InstanceState
 	Logger     Logger
 	Error      error
+	Stopped    bool
 }
 
 type InstanceState struct {
 	NodeState   *NodeState
 	Index       uint
 	ContainerId string
+	LocalVars   VarRepository
 	Logger      Logger
 	Error       error
+	Stopped     bool
+
+	cidfile string
 }
 
 func (cs *CloudState) Lock() {
@@ -99,7 +110,7 @@ func (cs *CloudState) LoadImage(name string) error {
 	cs.Lock()
 	loader, exists := cs.Images[name]
 	if exists {
-		for !loader.Complete {
+		for atomic.LoadInt32(&loader.complete) == 0 {
 			cs.Wait()
 		}
 		cs.Unlock()
@@ -109,14 +120,33 @@ func (cs *CloudState) LoadImage(name string) error {
 		cs.Images[name] = loader
 		cs.Unlock()
 		loader.Load()
+		atomic.StoreInt32(&loader.complete, 1)
 		cs.Notify()
 	}
 	return loader.Error
 }
 
-func (cs *CloudState) Substitute(text string) string {
-	// TODO
-	return text
+var varRegExp = regexp.MustCompilePOSIX("%\\([^()]+\\)")
+
+func (cs *CloudState) Substitute(text string, context *VarContext) string {
+	result := ""
+	curpos := 0
+	for _, index := range varRegExp.FindAllStringIndex(text, -1) {
+		start := index[0]
+		end := index[1]
+		if start > curpos {
+			result += text[curpos:start]
+		}
+		curpos = end + 1
+		name := text[start+2 : end-1]
+		if val, exists := cs.vars.QueryVar(name, context); exists {
+			result += val
+		}
+	}
+	if curpos < len(text) {
+		result += text[curpos:]
+	}
+	return result
 }
 
 func (cs *CloudState) AnyError() bool {
@@ -141,7 +171,6 @@ func (cs *CloudState) StopAndWait() {
 func (il *ImageLoader) Load() {
 	il.Logger.Info("Loading image")
 	il.Error = Docker(il.State.Env, il.Logger).Pull(il.Name)
-	il.Complete = true
 }
 
 func (ce *CloudEnv) Run() *CloudState {
@@ -149,6 +178,7 @@ func (ce *CloudEnv) Run() *CloudState {
 		Env:    ce,
 		Images: make(map[string]*ImageLoader),
 		Nodes:  make([]NodeState, len(ce.Cluster.Nodes)),
+		vars:   GlobalVarsRepo(),
 	}
 
 	cs.stateDir = path.Join(ce.DataDir, states, ce.Cluster.Name)
@@ -156,16 +186,35 @@ func (ce *CloudEnv) Run() *CloudState {
 
 	cs.cond = sync.NewCond(&cs.lock)
 
+	cs.vars.UpdateVar("project", ce.Cluster.Name)
+	cs.vars.UpdateVar("cluster", ce.Cluster.Name)
+	cs.vars.UpdateVar("container", "docker")
+	cs.vars.UpdateVar("os", "linux")
+
 	ce.Logger.Info("Starting cluster %s", ce.Cluster.Name)
 
 	var wg sync.WaitGroup
 	for i := 0; i < len(cs.Nodes); i++ {
-		cs.Nodes[i].Node = &ce.Cluster.Nodes[i]
+		ns := &cs.Nodes[i]
+		ns.State = cs
+		ns.Node = &ce.Cluster.Nodes[i]
+		ns.LocalVars = LocalVarsRepo()
+		ns.Instances = make([]InstanceState, ns.Node.Instances)
+		for j := 0; j < len(ns.Instances); j++ {
+			is := &ns.Instances[j]
+			is.NodeState = ns
+			is.Index = uint(j)
+			is.LocalVars = LocalVarsRepo()
+		}
 		wg.Add(1)
+	}
+	for i := 0; i < len(cs.Nodes); i++ {
 		go func(ns *NodeState) {
 			if ns.Error = ns.run(cs); ns.Error != nil {
 				ns.Logger.Error("%v", ns.Error)
 			}
+			ns.Stopped = true
+			cs.Notify()
 			wg.Done()
 		}(&cs.Nodes[i])
 	}
@@ -178,10 +227,15 @@ func (ns *NodeState) run(cs *CloudState) error {
 		return err
 	}
 
-	ns.State = cs
-	ns.Image = cs.Substitute(ns.Node.Image)
+	varCtx := &VarContext{Cloud: ns.State, Node: ns}
+
+	ns.LocalVars.UpdateVar("template", ns.Node.Name)
+	ns.LocalVars.UpdateVar("instances", fmt.Sprintf("%v", len(ns.Instances)))
+	ns.Image = cs.Substitute(ns.Node.Image, varCtx)
+	ns.LocalVars.UpdateVar("image", ns.Image)
+	cs.Notify()
+
 	ns.DockerArgs = []string{"-v", cs.Env.DataDir + ":" + workspace, "-w", workspace}
-	ns.Instances = make([]InstanceState, ns.Node.Instances)
 	ns.Logger = cs.Env.Logger.NewLogger(ns.Node.Name)
 
 	if err := cs.LoadImage(ns.Node.Image); err != nil {
@@ -193,14 +247,14 @@ func (ns *NodeState) run(cs *CloudState) error {
 	}
 	if ns.Node.Docker.Entrypoint != "" {
 		ns.DockerArgs = append(ns.DockerArgs, "--entrypoint")
-		ns.DockerArgs = append(ns.DockerArgs, cs.Substitute(ns.Node.Docker.Entrypoint))
+		ns.DockerArgs = append(ns.DockerArgs, cs.Substitute(ns.Node.Docker.Entrypoint, varCtx))
 	}
 	for _, env := range ns.Node.Docker.Env {
 		ns.DockerArgs = append(ns.DockerArgs, "-e")
-		ns.DockerArgs = append(ns.DockerArgs, cs.Substitute(env))
+		ns.DockerArgs = append(ns.DockerArgs, cs.Substitute(env, varCtx))
 	}
 	for _, vol := range ns.Node.Docker.Volumes {
-		volMap := cs.Substitute(vol)
+		volMap := cs.Substitute(vol, varCtx)
 		if pos := strings.Index(volMap, ":"); pos > 0 {
 			src := volMap[0:pos]
 			dst := volMap[pos+1:]
@@ -232,6 +286,8 @@ func (ns *NodeState) run(cs *CloudState) error {
 			if is.Error = is.run(ns, index); is.Error != nil {
 				is.Logger.Error("%v", is.Error)
 			}
+			is.Stopped = true
+			cs.Notify()
 			wg.Done()
 		}(uint(i), &ns.Instances[i])
 	}
@@ -256,15 +312,13 @@ func (ns *NodeState) AnyError() bool {
 
 func (is *InstanceState) run(ns *NodeState, index uint) (err error) {
 	name := fmt.Sprintf("%s.%v", ns.Node.Name, index)
-	cidfile := path.Join(ns.State.stateDir, name+".cid")
 	runDir := path.Join(ns.State.stateDir, name+".run")
 	localScript := path.Join(runDir, "cmd.sh")
 	remoteScript := path.Join(ns.State.workspace, name+".run", "cmd.sh")
 	remoteWrapper := path.Join(ns.State.workspace, name+".run", "run.sh")
 
-	is.NodeState = ns
-	is.Index = index
 	is.Logger = ns.Logger.NewLogger(name)
+	is.cidfile = path.Join(ns.State.stateDir, name+".cid")
 
 	runCmds := (ns.State.Env.RunFlags & Run) != 0
 	if runCmds {
@@ -279,7 +333,7 @@ func (is *InstanceState) run(ns *NodeState, index uint) (err error) {
 		}
 	}
 	is.Logger.Info("Spawning instance")
-	if is.ContainerId, err = is.docker().Create(cidfile, ns.DockerArgs); err != nil {
+	if is.ContainerId, err = is.docker().Create(is.cidfile, ns.DockerArgs); err != nil {
 		return err
 	}
 
@@ -289,8 +343,17 @@ func (is *InstanceState) run(ns *NodeState, index uint) (err error) {
 		err = is.docker().Start(is.ContainerId, &ns.State.WaitGroup)
 	}
 	if err != nil {
+		is.remove()
 		return err
 	}
+
+	if ip, err := is.docker().Inspect(is.ContainerId, "{{.NetworkSettings.IPAddress}}"); err == nil {
+		is.LocalVars.UpdateVar("ip", ip)
+	}
+	if mac, err := is.docker().Inspect(is.ContainerId, "{{.NetworkSettings.MacAddress}}"); err == nil {
+		is.LocalVars.UpdateVar("mac", mac)
+	}
+	is.NodeState.State.Notify()
 
 	if runCmds {
 		if err = is.runCommands("run", remoteWrapper, localScript, remoteScript); err == nil {
@@ -316,9 +379,14 @@ func (is *InstanceState) runCommands(name, remoteWrapper, localScript, remoteScr
 	if !exists {
 		return nil
 	}
-	// TODO env, workdir
+
+	varCtx := &VarContext{Cloud: is.NodeState.State, Node: is.NodeState, Instance: is}
+	shell := "/bin/bash"
+	if commands.Shell != "" {
+		shell = commands.Shell
+	}
 	for _, command := range commands.Commands {
-		command = is.NodeState.State.Substitute(command)
+		command = is.NodeState.State.Substitute(command, varCtx)
 		if command = strings.Trim(command, " "); command == "" {
 			continue
 		}
@@ -326,7 +394,7 @@ func (is *InstanceState) runCommands(name, remoteWrapper, localScript, remoteScr
 		if err := os.Remove(localScript + ".exit"); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		if err := ioutil.WriteFile(localScript, []byte("#!/bin/sh\n"+command), 0777); err != nil {
+		if err := ioutil.WriteFile(localScript, []byte("#!"+shell+"\n"+command), 0777); err != nil {
 			return err
 		}
 		if err := is.docker().Exec(is.ContainerId, remoteWrapper); err != nil {
@@ -337,7 +405,9 @@ func (is *InstanceState) runCommands(name, remoteWrapper, localScript, remoteScr
 		} else if exitCode, err := strconv.Atoi(strings.Trim(string(result), " \n\r\t\f")); err != nil {
 			return err
 		} else if exitCode != 0 {
-			return errors.New(fmt.Sprintf("Exit %v: %s", exitCode, command))
+			err := errors.New(fmt.Sprintf("Exit %v: %s", exitCode, command))
+			is.Logger.Error("ERR %v", err)
+			return err
 		}
 	}
 	return nil
@@ -358,6 +428,12 @@ func (is *InstanceState) stop() {
 func (is *InstanceState) remove() {
 	if is.ContainerId != "" {
 		is.Logger.Info("Removing")
-		is.docker().Remove(is.ContainerId)
+		is.docker().RmForce(is.ContainerId)
+		if is.cidfile != "" {
+			if os.Remove(is.cidfile) == nil {
+				is.cidfile = ""
+			}
+		}
+		is.ContainerId = ""
 	}
 }

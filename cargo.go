@@ -27,7 +27,7 @@ var (
 	env      *cargo.CloudEnv
 	clusters *cargo.Clusters
 
-	logFormatter = logging.MustStringFormatter("%{color}%{time:15:04:05.000000} %{id:04x} %{level:.4s} %{color:bold}[%{module}]%{color:reset} %{message}")
+	logFormatter = logging.MustStringFormatter("%{color}%{time:15:04:05.000000} %{level:.4s} %{color:bold}[%{module}]%{color:reset} %{message}")
 
 	errorNoDefaultCluster = errors.New("Default cluster not found")
 )

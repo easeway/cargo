@@ -7,17 +7,21 @@ clusters:
         docker:
             cmd:
               - '-data-dir=/data'
-              - '-name=%{instance}'
+              - '-name=%(instance)'
       - name: client
         image: ubuntu:14.04
         docker:
-           entrypoint: /bin/bash
-           cmd:
+          env:
+              - ETCD_IP=%(ip:etcd-0)
+          entrypoint: /bin/bash
+          cmd:
               - '-c'
               - 'while true; do sleep 1; done'
         run:
             commands:
+              - echo $ETCD_IP
+              - echo %(env:PATH)
               - pwd
               - env
-              - curl http://%{ip:etcd-0}:4001/v2/machines
+              - curl http://%(ip:etcd-0):4001/v2/machines
 

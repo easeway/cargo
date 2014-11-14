@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -51,24 +52,26 @@ func (d *docker) cmd(arg ...string) *exec.Cmd {
 	return cmd
 }
 
-func (d *docker) cmdOutput(arg ...string) ([]byte, error) {
+func (d *docker) cmdOutput(arg ...string) (string, error) {
 	if out, err := d.cmdBase(arg...).Output(); err != nil {
-		return nil, err
+		return "", err
 	} else {
-		for _, line := range strings.Split(string(out), "\n") {
+		output := strings.Trim(string(out), " \n\r\t\f")
+		for _, line := range strings.Split(output, "\n") {
 			d.logger.Debug("%s.o | %s", d.seq, line)
 		}
-		return out, err
+		return output, err
 	}
 }
 
-//func (d *docker) Inspect(cid, fmt string) (string, error) {
-//	if output, err := d.cmd("inspect", "-f", fmt, cid).Output(); err == nil {
-//		return string(output), err
-//	} else {
-//		return "", err
-//	}
-//}
+func (d *docker) isRunning(cid string) (bool, error) {
+	running, err := d.Inspect(cid, "{{.State.Running}}")
+	return running == "true", err
+}
+
+func (d *docker) Inspect(cid, fmt string) (string, error) {
+	return d.cmdOutput("inspect", "-f", fmt, cid)
+}
 
 func (d *docker) Pull(image string) error {
 	return d.cmd("pull", image).Run()
@@ -80,14 +83,37 @@ func (d *docker) Create(cidfile string, args []string) (string, error) {
 	cmdArgs[0] = "create"
 	cmdArgs[1] = "--cidfile=" + cidfile
 
+	cid := ""
+	if cidBytes, err := ioutil.ReadFile(cidfile); err == nil {
+		cid = string(cidBytes)
+	}
+
+	if cid != "" {
+		if running, err := d.isRunning(cid); err == nil {
+			if running {
+				d.Stop(cid)
+			}
+			cmdArgs = append(cmdArgs, "--volumes-from="+cid)
+		} else {
+			cid = ""
+		}
+	}
+
 	if err := os.Remove(cidfile); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	if output, err := d.cmdOutput(cmdArgs...); err == nil {
-		return strings.Trim(string(output), " \n\r\t\f"), nil
-	} else {
-		return "", err
+
+	newCid, err := d.cmdOutput(cmdArgs...)
+
+	if cid != "" {
+		if err == nil {
+			d.RmForce(cid)
+		} else {
+			ioutil.WriteFile(cidfile, []byte(cid), 0777)
+		}
 	}
+
+	return newCid, err
 }
 
 func (d *docker) Start(cid string, wg *sync.WaitGroup) error {
@@ -111,10 +137,8 @@ func (d *docker) Start(cid string, wg *sync.WaitGroup) error {
 		}()
 
 		for i := 0; i < 8; i++ {
-			if out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", cid).Output(); err == nil {
-				if strings.Trim(string(out), " \r\n\t\f") == "true" {
-					return nil
-				}
+			if running, err := d.isRunning(cid); err == nil && running {
+				return nil
 			}
 			time.Sleep(time.Duration((i+1)*100) * time.Millisecond)
 		}
@@ -122,67 +146,16 @@ func (d *docker) Start(cid string, wg *sync.WaitGroup) error {
 	}
 }
 
-//func (d *docker) RunDetached(cidfile string, args []string) (string, error) {
-//	cmdArgs := make([]string, len(args)+3)
-//	copy(cmdArgs[2:], args)
-//	cmdArgs[0] = "run"
-//	cmdArgs[1] = "-d"
-//	cmdArgs[2] = "--cidfile=" + cidfile
-//	if err := os.Remove(cidfile); err != nil && !os.IsNotExist(err) {
-//		return "", err
-//	}
-//	if output, err := d.cmdOutput(cmdArgs...); err == nil {
-//		return string(output), nil
-//	} else {
-//		return "", err
-//	}
-//}
-
-//func (d *docker) Run(cidfile string, args []string, wg *sync.WaitGroup) (string, *exec.Cmd, error) {
-//	cmdArgs := make([]string, len(args)+2)
-//	copy(cmdArgs[2:], args)
-//	cmdArgs[0] = "run"
-//	cmdArgs[1] = "--cidfile=" + cidfile
-
-//	if err := os.Remove(cidfile); err != nil && !os.IsNotExist(err) {
-//		return err
-//	}
-
-//	cmd := d.cmd(cmdArgs...)
-//	if err := cmd.Start(); err != nil {
-//		return "", nil, err
-//	}
-
-//	for i := 0; i < 8; i++ {
-//		if _, err := os.Stat(cidfile); err == nil {
-//			break
-//		}
-//		time.Sleep(time.Duration((i+1)*100) * time.Millisecond)
-//	}
-
-//	if wg != nil {
-//		wg.Add(1)
-//		go func() {
-//			cmd.Wait()
-//			wg.Done()
-//		}()
-//	}
-
-//	if cidBytes, err := ioutil.ReadFile(cidfile); err != nil {
-//		return "", cmd, err
-//	} else {
-//		return string(cidBytes), cmd, nil
-//	}
-//}
-
 func (d *docker) Stop(cid string) error {
 	return d.cmd("stop", cid).Run()
 }
 
 func (d *docker) Remove(cid string) error {
-	d.cmd("rm", cid).Run()
-	// ignore the errors
-	return nil
+	return d.cmd("rm", cid).Run()
+}
+
+func (d *docker) RmForce(cid string) error {
+	return d.cmd("rm", "--force", cid).Run()
 }
 
 func (d *docker) Exec(cid string, args ...string) error {
